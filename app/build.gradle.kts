@@ -56,4 +56,5 @@ dependencies {
     implementation("com.google.mlkit:genai-common:1.0.0-beta1")
     implementation("com.google.mlkit:genai-image-description:1.0.0-beta1")
     implementation("com.google.mlkit:image-labeling:17.0.9")
+    implementation("com.google.mlkit:object-detection:17.0.2")
 }

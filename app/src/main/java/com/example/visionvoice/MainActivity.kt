@@ -39,6 +39,10 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.label.ImageLabeler
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.ObjectDetector
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import com.google.android.gms.tasks.Tasks
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ExecutorService
@@ -51,6 +55,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var imageCapture: ImageCapture
     private var imageDescriber: ImageDescriber? = null
     private var imageLabeler: ImageLabeler? = null
+    private var objectDetector: ObjectDetector? = null
     private lateinit var cameraExecutor: ExecutorService
     private var isDescribing = false
     private var lastStatusText: String? = null
@@ -81,6 +86,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         imageLabeler = tryCreateLocalLabeler()
+        objectDetector = runCatching {
+            val odOptions = ObjectDetectorOptions.Builder()
+                .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
+                .enableMultipleObjects()
+                .enableClassification()
+                .build()
+            ObjectDetection.getClient(odOptions)
+        }.getOrElse {
+            Log.e("VisionVoice", "ObjectDetector init failed", it)
+            null
+        }
 
         imageDescriber = runCatching {
             ImageDescription.getClient(
@@ -335,26 +351,65 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         setBusyState(true, "Analizando con reconocimiento local...")
         updateStatus(reason)
         val image = InputImage.fromBitmap(bitmap, 0)
-        labeler.process(image)
-            .addOnSuccessListener { labels ->
-                val spoken = buildFallbackDescription(bitmap, labels)
-                updateStatus(spoken)
-                speak(spoken)
-                isDescribing = false
-                setBusyState(false)
-            }
-            .addOnFailureListener { error ->
-                updateStatus("No se pudo describir la imagen: ${error.message ?: error.javaClass.simpleName}")
-                isDescribing = false
-                setBusyState(false)
-            }
+
+        val labelTask = labeler.process(image)
+        val detector = objectDetector
+        if (detector != null) {
+            val odTask = detector.process(image)
+            Tasks.whenAllComplete(labelTask, odTask)
+                .addOnSuccessListener {
+                    val labels = if (labelTask.isSuccessful) {
+                        labelTask.result ?: emptyList()
+                    } else {
+                        emptyList()
+                    }
+                    val objects = if (odTask.isSuccessful) {
+                        odTask.result ?: emptyList()
+                    } else {
+                        emptyList()
+                    }
+                    if (labels.isEmpty() && !labelTask.isSuccessful) {
+                        updateStatus(
+                            "No se pudo describir la imagen: ${labelTask.exception?.message ?: "error desconocido"}",
+                        )
+                        isDescribing = false
+                        setBusyState(false)
+                        return@addOnSuccessListener
+                    }
+                    val odCategories = objects
+                        .flatMap { obj -> obj.labels.map { it.text.lowercase(Locale.getDefault()) } }
+                        .toSet()
+                    Log.d("VisionVoice", "Labels: ${labels.map { "${it.text}(${it.confidence})" }}")
+                    Log.d("VisionVoice", "OD categories: $odCategories")
+                    val spoken = buildFallbackDescription(bitmap, labels, odCategories)
+                    updateStatus(spoken)
+                    speak(spoken)
+                    isDescribing = false
+                    setBusyState(false)
+                }
+        } else {
+            labelTask
+                .addOnSuccessListener { labels ->
+                    Log.d("VisionVoice", "Labels: ${labels.map { "${it.text}(${it.confidence})" }}")
+                    val spoken = buildFallbackDescription(bitmap, labels)
+                    updateStatus(spoken)
+                    speak(spoken)
+                    isDescribing = false
+                    setBusyState(false)
+                }
+                .addOnFailureListener { error ->
+                    updateStatus("No se pudo describir la imagen: ${error.message ?: error.javaClass.simpleName}")
+                    isDescribing = false
+                    setBusyState(false)
+                }
+        }
     }
 
     private fun tryCreateLocalLabeler(): ImageLabeler? {
         val created = runCatching {
             ImageLabeling.getClient(
                 ImageLabelerOptions.Builder()
-                    .setConfidenceThreshold(0.55f)
+                    .setConfidenceThreshold(0.30f)
                     .build(),
             )
         }.getOrElse {
@@ -373,91 +428,59 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun buildFallbackDescription(
         bitmap: Bitmap,
         labels: List<com.google.mlkit.vision.label.ImageLabel>,
+        odCategories: Set<String> = emptySet(),
     ): String {
-        if (labels.isEmpty()) {
+        if (labels.isEmpty() && odCategories.isEmpty()) {
             return "No pude reconocer objetos claros en la imagen."
         }
 
-        val ordered = labels.sortedByDescending { it.confidence }
-        val translated = ordered
-            .take(7)
-            .map { translateLabel(it.text) }
-            .distinct()
-        val primaryObject = inferPrimaryObject(translated)
-        val materialHints = translated
-            .filter { it in MATERIAL_OR_PART_WORDS }
-            .take(2)
+        val topLabels = labels
+            .sortedByDescending { it.confidence }
+            .take(5)
+
+        Log.d("VisionVoice", "=== RAW LABELS ===")
+        labels.forEach { Log.d("VisionVoice", "  '${it.text}' conf=${it.confidence}") }
+        Log.d("VisionVoice", "OD categories: $odCategories")
+
+        val parts = mutableListOf<String>()
+
+        if (topLabels.isNotEmpty()) {
+            val best = topLabels.first()
+            val intro = when {
+                best.confidence >= 0.85f -> "Veo"
+                best.confidence >= 0.70f -> "Parece ser"
+                else -> "Podria ser"
+            }
+            parts.add("$intro ${best.text}")
+
+            val others = topLabels.drop(1).take(3).map { it.text }
+            if (others.isNotEmpty()) {
+                parts.add("Tambien detecto ${others.joinToString(", ")}")
+            }
+        }
+
+        if (odCategories.isNotEmpty()) {
+            val translated = odCategories.map { translateOdCategory(it) }
+            parts.add("Categoria: ${translated.joinToString(", ")}")
+        }
+
         val colorHint = detectDominantColorName(bitmap)
-
-        val intro = when (ordered.first().confidence) {
-            in 0.85f..1.0f -> "Estoy viendo"
-            in 0.70f..0.8499f -> "Parece que estoy viendo"
-            else -> "Podria estar viendo"
+        if (colorHint != null) {
+            parts.add("Color predominante: $colorHint")
         }
 
-        val objectSentence = if (primaryObject != null) {
-            "$intro ${articleFor(primaryObject)} $primaryObject"
-        } else {
-            "$intro un objeto"
-        }
-
-        val colorSentence = colorHint?.let { " de color $it" } ?: ""
-        val sceneContext = inferSceneContext(translated)
-        val sceneSentence = sceneContext?.let { " Parece una escena $it." } ?: ""
-        val materialSentence = if (materialHints.isNotEmpty()) {
-            " Tambien detecto ${joinForSpeech(materialHints)}."
-        } else {
-            ""
-        }
-
-        return "$objectSentence$colorSentence.$sceneSentence$materialSentence".trim()
+        return parts.joinToString(". ") + "."
     }
 
-    private fun joinForSpeech(items: List<String>): String {
-        return when (items.size) {
-            0 -> ""
-            1 -> items[0]
-            2 -> "${items[0]} y ${items[1]}"
-            else -> "${items[0]}, ${items[1]} y ${items[2]}"
-        }
-    }
-
-    private fun inferSceneContext(labels: List<String>): String? {
-        val set = labels.map { it.lowercase(Locale.getDefault()) }.toSet()
-
-        if (set.any { it in OUTDOOR_WORDS }) return "al aire libre"
-        if (set.any { it in INDOOR_WORDS }) return "de interior"
-        if (set.any { it in FOOD_WORDS }) return "de comida"
-        if (set.any { it in ANIMAL_WORDS }) return "con animales"
-        if (set.any { it in PEOPLE_WORDS }) return "con personas"
-        if (set.any { it in TECH_WORDS }) return "con tecnologia"
-
-        return null
-    }
-
-    private fun inferPrimaryObject(labels: List<String>): String? {
-        val normalized = labels.map { it.lowercase(Locale.getDefault()) }
-
-        for (label in normalized) {
-            val mapped = PRIMARY_OBJECT_ALIASES[label]
-            if (mapped != null) return mapped
-        }
-
-        return normalized.firstOrNull { candidate ->
-            candidate !in MATERIAL_OR_PART_WORDS &&
-                candidate !in OUTDOOR_WORDS &&
-                candidate !in INDOOR_WORDS &&
-                candidate !in FOOD_WORDS &&
-                candidate !in ANIMAL_WORDS &&
-                candidate !in PEOPLE_WORDS &&
-                candidate !in TECH_WORDS
-        }
-    }
-
-    private fun articleFor(noun: String): String {
-        return when (noun.lowercase(Locale.getDefault())) {
-            in FEMININE_OBJECTS -> "una"
-            else -> "un"
+    private fun translateOdCategory(category: String): String {
+        val lower = category.lowercase(Locale.getDefault())
+        return when {
+            "home" in lower -> "articulo del hogar"
+            "food" in lower -> "comida"
+            "fashion" in lower -> "articulo de moda"
+            "plant" in lower -> "planta"
+            "place" in lower -> "lugar"
+            else -> category
         }
     }
 
@@ -510,11 +533,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             h < 295f -> "violeta"
             else -> "rosado"
         }
-    }
-
-    private fun translateLabel(raw: String): String {
-        val key = raw.trim().lowercase(Locale.getDefault())
-        return LABEL_TRANSLATIONS[key] ?: key
     }
 
     private fun speak(text: String) {
@@ -661,136 +679,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         cameraExecutor.shutdown()
         imageDescriber?.close()
         imageLabeler?.close()
+        objectDetector?.close()
         tts?.stop()
         tts?.shutdown()
     }
 
-    companion object {
-        private val PRIMARY_OBJECT_ALIASES = mapOf(
-            "trash can" to "papelera",
-            "garbage can" to "papelera",
-            "recycling bin" to "papelera",
-            "waste container" to "papelera",
-            "dustbin" to "papelera",
-            "bin" to "papelera",
-            "papelera" to "papelera",
-            "basurero" to "papelera",
-            "contenedor de basura" to "papelera",
-            "container" to "contenedor",
-            "contenedor" to "contenedor",
-            "bottle" to "botella",
-            "botella" to "botella",
-            "cup" to "taza",
-            "taza" to "taza",
-            "chair" to "silla",
-            "silla" to "silla",
-            "table" to "mesa",
-            "mesa" to "mesa",
-            "car" to "auto",
-            "auto" to "auto",
-            "dog" to "perro",
-            "perro" to "perro",
-            "cat" to "gato",
-            "gato" to "gato",
-            "person" to "persona",
-            "persona" to "persona",
-        )
-
-        private val FEMININE_OBJECTS = setOf(
-            "papelera", "botella", "taza", "silla", "mesa", "persona", "bicicleta", "moto",
-        )
-
-        private val MATERIAL_OR_PART_WORDS = setOf(
-            "metal", "acero", "hierro", "plastico", "goma", "caucho", "madera", "vidrio",
-            "rueda", "neumatico", "tire", "wheel", "material", "textura",
-        )
-
-        private val OUTDOOR_WORDS = setOf(
-            "cielo", "nube", "arbol", "arboles", "pasto", "planta",
-            "montana", "montanas", "calle", "carretera", "parque", "playa",
-            "sky", "cloud", "tree", "grass", "mountain", "street", "road", "beach",
-        )
-
-        private val INDOOR_WORDS = setOf(
-            "silla", "mesa", "habitacion", "cocina", "sofa", "cama", "televisor",
-            "chair", "table", "room", "kitchen", "sofa", "bed", "tv",
-        )
-
-        private val FOOD_WORDS = setOf(
-            "comida", "plato", "postre", "fruta", "verdura", "pizza", "hamburguesa",
-            "food", "dish", "dessert", "fruit", "vegetable", "pizza", "burger",
-        )
-
-        private val ANIMAL_WORDS = setOf(
-            "animal", "perro", "gato", "pajaro", "caballo", "vaca",
-            "animal", "dog", "cat", "bird", "horse", "cow",
-        )
-
-        private val PEOPLE_WORDS = setOf(
-            "persona", "personas", "hombre", "mujer", "nino", "nina", "cara",
-            "person", "people", "man", "woman", "boy", "girl", "face",
-        )
-
-        private val TECH_WORDS = setOf(
-            "computadora", "telefono", "celular", "pantalla", "teclado", "mouse",
-            "computer", "phone", "screen", "keyboard", "mouse",
-        )
-
-        private val LABEL_TRANSLATIONS = mapOf(
-            "person" to "persona",
-            "people" to "personas",
-            "man" to "hombre",
-            "woman" to "mujer",
-            "boy" to "nino",
-            "girl" to "nina",
-            "face" to "cara",
-            "dog" to "perro",
-            "cat" to "gato",
-            "bird" to "pajaro",
-            "car" to "auto",
-            "truck" to "camion",
-            "bus" to "omnibus",
-            "wheel" to "rueda",
-            "weel" to "rueda",
-            "tire" to "neumatico",
-            "metal" to "metal",
-            "steel" to "acero",
-            "iron" to "hierro",
-            "plastic" to "plastico",
-            "rubber" to "goma",
-            "trash can" to "papelera",
-            "garbage can" to "papelera",
-            "recycling bin" to "papelera",
-            "waste container" to "papelera",
-            "dustbin" to "papelera",
-            "bin" to "papelera",
-            "bicycle" to "bicicleta",
-            "motorcycle" to "moto",
-            "tree" to "arbol",
-            "sky" to "cielo",
-            "cloud" to "nube",
-            "grass" to "pasto",
-            "flower" to "flor",
-            "plant" to "planta",
-            "food" to "comida",
-            "fruit" to "fruta",
-            "vegetable" to "verdura",
-            "pizza" to "pizza",
-            "burger" to "hamburguesa",
-            "drink" to "bebida",
-            "water" to "agua",
-            "table" to "mesa",
-            "chair" to "silla",
-            "sofa" to "sofa",
-            "bed" to "cama",
-            "room" to "habitacion",
-            "kitchen" to "cocina",
-            "computer" to "computadora",
-            "laptop" to "laptop",
-            "phone" to "telefono",
-            "screen" to "pantalla",
-            "book" to "libro",
-            "text" to "texto",
-        )
-    }
+    companion object
 }
