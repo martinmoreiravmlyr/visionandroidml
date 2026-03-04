@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vision Voice</string>
+    <string name="title">Vision Voice</string>
+    <string name="subtitle">Captura una foto y escucha una descripcion natural.</string>
+    <string name="description_label">Descripcion</string>
+    <string name="status_initial">Cuando tomes una foto, aqui veras la descripcion en texto y tambien la escucharas.</string>
+    <string name="capture_button">Capturar y Describir</string>
+    <string name="capture_button_processing">Procesando...</string>
+    <string name="captured_image">Imagen capturada</string>
+    <string name="mode_auto">AUTO</string>
+    <string name="mode_genai">GENAI</string>
+    <string name="mode_local">LOCAL</string>
+    <string name="processing_generic">Analizando imagen...</string>
+</resources>

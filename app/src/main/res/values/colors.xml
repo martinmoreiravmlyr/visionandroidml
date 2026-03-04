@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="brand_primary">#0D1D2E</color>
+    <color name="brand_primary_dark">#08121D</color>
+    <color name="brand_accent">#38D4C8</color>
+    <color name="brand_accent_dark">#25B5AA</color>
+
+    <color name="panel_surface">#E8F6FBFF</color>
+    <color name="panel_stroke">#40FFFFFF</color>
+
+    <color name="text_primary">#08202E</color>
+    <color name="text_muted">#4B6A7A</color>
+    <color name="text_on_dark">#FFFFFFFF</color>
+    <color name="text_on_dark_secondary">#CCFFFFFF</color>
+
+    <color name="button_primary">#38D4C8</color>
+    <color name="button_text">#032025</color>
+    <color name="button_ripple">#4D032025</color>
+
+    <color name="mode_text">#0A3140</color>
+    <color name="mode_auto_bg">#CCE7F2F7</color>
+    <color name="mode_genai_bg">#CCBCE7FF</color>
+    <color name="mode_local_bg">#CCD2F6EA</color>
+    <color name="text_surface_bg">#B3FFFFFF</color>
+</resources>
