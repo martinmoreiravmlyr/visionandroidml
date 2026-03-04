@@ -9,7 +9,9 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewGroup
 import android.view.animation.OvershootInterpolator
+import android.util.Log
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -18,10 +20,16 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updateLayoutParams
+import androidx.core.view.updatePadding
 import com.example.visionvoice.databinding.ActivityMainBinding
 import com.google.mlkit.genai.common.DownloadCallback
 import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.common.GenAiException
+import com.google.mlkit.common.MlKit
 import com.google.mlkit.genai.imagedescription.ImageDescriber
 import com.google.mlkit.genai.imagedescription.ImageDescriberOptions
 import com.google.mlkit.genai.imagedescription.ImageDescription
@@ -34,16 +42,20 @@ import java.io.File
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var imageCapture: ImageCapture
-    private lateinit var imageDescriber: ImageDescriber
-    private lateinit var imageLabeler: ImageLabeler
+    private var imageDescriber: ImageDescriber? = null
+    private var imageLabeler: ImageLabeler? = null
     private lateinit var cameraExecutor: ExecutorService
     private var isDescribing = false
     private var lastStatusText: String? = null
+    private var genAiInitError: String? = null
+    private var localLabelerInitError: String? = null
+    private var cameraReady = false
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -61,16 +73,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        configureSystemInsets()
+
+        runCatching { MlKit.initialize(applicationContext) }
+            .onFailure { Log.e("VisionVoice", "MlKit.initialize failed", it) }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        imageDescriber = ImageDescription.getClient(
-            ImageDescriberOptions.builder(this).build(),
-        )
-        imageLabeler = ImageLabeling.getClient(
-            ImageLabelerOptions.Builder()
-                .setConfidenceThreshold(0.55f)
-                .build(),
-        )
+        imageLabeler = tryCreateLocalLabeler()
+
+        imageDescriber = runCatching {
+            ImageDescription.getClient(
+                ImageDescriberOptions.builder(this).build(),
+            )
+        }.getOrElse {
+            genAiInitError = it.message
+            null
+        }
+
         tts = TextToSpeech(this, this)
         setModeAuto()
         runIntroAnimations()
@@ -79,6 +98,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             capturePhoto()
         }
+        binding.captureButton.isEnabled = true
+        updateStatus("Iniciando camara...")
 
         if (hasCameraPermission()) {
             startCamera()
@@ -127,8 +148,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         preview,
                         imageCapture,
                     )
+                    cameraReady = true
                     updateStatus("Camara lista. Toma una foto.")
                 } catch (e: Exception) {
+                    cameraReady = false
                     updateStatus("Error iniciando camara: ${e.message}")
                 }
             },
@@ -137,7 +160,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun capturePhoto() {
-        if (!::imageCapture.isInitialized) {
+        if (!cameraReady || !::imageCapture.isInitialized) {
             updateStatus("La camara aun no esta lista.")
             return
         }
@@ -190,7 +213,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         setBusyState(true, "Preparando descripcion...")
         updateStatus("Preparando descripcion de imagen...")
 
-        val statusFuture = imageDescriber.checkFeatureStatus()
+        val describer = imageDescriber
+        if (describer == null) {
+            val reason = genAiInitError?.let {
+                "GenAI no disponible ($it). Usando reconocimiento local..."
+            } ?: "GenAI no disponible. Usando reconocimiento local..."
+            runLabelFallback(bitmap, reason)
+            return
+        }
+
+        val statusFuture = describer.checkFeatureStatus()
         statusFuture.addListener(
             {
                 try {
@@ -198,14 +230,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         FeatureStatus.AVAILABLE -> {
                             setModeGenAi()
                             setBusyState(true, "Generando descripcion con GenAI...")
-                            runDescription(bitmap)
+                            runDescription(describer, bitmap)
                         }
 
                         FeatureStatus.DOWNLOADABLE -> {
                             setModeGenAi()
                             setBusyState(true, "Descargando modelo GenAI...")
                             updateStatus("Descargando modelo de descripcion...")
-                            imageDescriber.downloadFeature(
+                            describer.downloadFeature(
                                 object : DownloadCallback {
                                     override fun onDownloadStarted(bytesToDownload: Long) {
                                         setBusyState(true, "Descarga iniciada...")
@@ -218,7 +250,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                     override fun onDownloadCompleted() {
                                         setBusyState(true, "Modelo listo, generando descripcion...")
                                         updateStatus("Modelo descargado. Generando descripcion...")
-                                        runDescription(bitmap)
+                                        runDescription(describer, bitmap)
                                     }
 
                                     override fun onDownloadFailed(exception: GenAiException) {
@@ -236,7 +268,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                             setModeGenAi()
                             setBusyState(true, "Esperando descarga en curso...")
                             updateStatus("El modelo aun se esta descargando. Reintentando...")
-                            runDescription(bitmap)
+                            runDescription(describer, bitmap)
                         }
 
                         else -> {
@@ -257,9 +289,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         )
     }
 
-    private fun runDescription(bitmap: Bitmap) {
+    private fun runDescription(describer: ImageDescriber, bitmap: Bitmap) {
         val request = ImageDescriptionRequest.builder(bitmap).build()
-        val descriptionFuture = imageDescriber.runInference(request)
+        val descriptionFuture = describer.runInference(request)
 
         descriptionFuture.addListener(
             {
@@ -289,11 +321,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun runLabelFallback(bitmap: Bitmap, reason: String) {
+        val labeler = imageLabeler ?: tryCreateLocalLabeler()
+        if (labeler == null) {
+            val details = localLabelerInitError ?: "sin detalle"
+            updateStatus("No se pudo iniciar ML Kit local: $details")
+            isDescribing = false
+            setBusyState(false)
+            return
+        }
+
         setModeLocal()
         setBusyState(true, "Analizando con reconocimiento local...")
         updateStatus(reason)
         val image = InputImage.fromBitmap(bitmap, 0)
-        imageLabeler.process(image)
+        labeler.process(image)
             .addOnSuccessListener { labels ->
                 val spoken = buildFallbackDescription(labels)
                 updateStatus(spoken)
@@ -302,10 +343,30 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 setBusyState(false)
             }
             .addOnFailureListener { error ->
-                updateStatus("No se pudo describir la imagen: ${error.message}")
+                updateStatus("No se pudo describir la imagen: ${error.message ?: error.javaClass.simpleName}")
                 isDescribing = false
                 setBusyState(false)
             }
+    }
+
+    private fun tryCreateLocalLabeler(): ImageLabeler? {
+        val created = runCatching {
+            ImageLabeling.getClient(
+                ImageLabelerOptions.Builder()
+                    .setConfidenceThreshold(0.55f)
+                    .build(),
+            )
+        }.getOrElse {
+            localLabelerInitError = "${it.javaClass.simpleName}: ${it.message ?: "sin detalle"}"
+            Log.e("VisionVoice", "Local labeler init failed", it)
+            null
+        }
+
+        if (created != null) {
+            localLabelerInitError = null
+            imageLabeler = created
+        }
+        return created
     }
 
     private fun buildFallbackDescription(
@@ -484,11 +545,35 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun configureSystemInsets() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.rootContainer) { _, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+
+            binding.headerContainer.updatePadding(top = insets.top + dp(8))
+
+            binding.bottomPanel.updateLayoutParams<ViewGroup.MarginLayoutParams> {
+                bottomMargin = insets.bottom + dp(12)
+            }
+
+            binding.capturedImage.updateLayoutParams<ViewGroup.MarginLayoutParams> {
+                bottomMargin = insets.bottom + dp(20)
+            }
+
+            windowInsets
+        }
+        ViewCompat.requestApplyInsets(binding.rootContainer)
+    }
+
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density).roundToInt()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        imageDescriber.close()
-        imageLabeler.close()
+        imageDescriber?.close()
+        imageLabeler?.close()
         tts?.stop()
         tts?.shutdown()
     }
