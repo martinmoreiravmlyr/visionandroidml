@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.view.HapticFeedbackConstants
@@ -336,7 +337,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val image = InputImage.fromBitmap(bitmap, 0)
         labeler.process(image)
             .addOnSuccessListener { labels ->
-                val spoken = buildFallbackDescription(labels)
+                val spoken = buildFallbackDescription(bitmap, labels)
                 updateStatus(spoken)
                 speak(spoken)
                 isDescribing = false
@@ -370,6 +371,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun buildFallbackDescription(
+        bitmap: Bitmap,
         labels: List<com.google.mlkit.vision.label.ImageLabel>,
     ): String {
         if (labels.isEmpty()) {
@@ -377,30 +379,38 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         val ordered = labels.sortedByDescending { it.confidence }
-        val candidates = ordered
-            .take(5)
+        val translated = ordered
+            .take(7)
             .map { translateLabel(it.text) }
             .distinct()
-            .take(3)
+        val primaryObject = inferPrimaryObject(translated)
+        val materialHints = translated
+            .filter { it in MATERIAL_OR_PART_WORDS }
+            .take(2)
+        val colorHint = detectDominantColorName(bitmap)
 
-        if (candidates.isEmpty()) {
-            return "No pude armar una descripcion clara."
+        val intro = when (ordered.first().confidence) {
+            in 0.85f..1.0f -> "Estoy viendo"
+            in 0.70f..0.8499f -> "Parece que estoy viendo"
+            else -> "Podria estar viendo"
         }
 
-        val certainty = when (ordered.first().confidence) {
-            in 0.85f..1.0f -> "Veo con bastante claridad"
-            in 0.70f..0.8499f -> "Parece que hay"
-            else -> "Podria haber"
-        }
-
-        val sceneContext = inferSceneContext(candidates)
-        val objectsText = joinForSpeech(candidates)
-
-        return if (sceneContext == null) {
-            "$certainty $objectsText."
+        val objectSentence = if (primaryObject != null) {
+            "$intro ${articleFor(primaryObject)} $primaryObject"
         } else {
-            "$certainty $objectsText. Parece una escena $sceneContext."
+            "$intro un objeto"
         }
+
+        val colorSentence = colorHint?.let { " de color $it" } ?: ""
+        val sceneContext = inferSceneContext(translated)
+        val sceneSentence = sceneContext?.let { " Parece una escena $it." } ?: ""
+        val materialSentence = if (materialHints.isNotEmpty()) {
+            " Tambien detecto ${joinForSpeech(materialHints)}."
+        } else {
+            ""
+        }
+
+        return "$objectSentence$colorSentence.$sceneSentence$materialSentence".trim()
     }
 
     private fun joinForSpeech(items: List<String>): String {
@@ -423,6 +433,83 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (set.any { it in TECH_WORDS }) return "con tecnologia"
 
         return null
+    }
+
+    private fun inferPrimaryObject(labels: List<String>): String? {
+        val normalized = labels.map { it.lowercase(Locale.getDefault()) }
+
+        for (label in normalized) {
+            val mapped = PRIMARY_OBJECT_ALIASES[label]
+            if (mapped != null) return mapped
+        }
+
+        return normalized.firstOrNull { candidate ->
+            candidate !in MATERIAL_OR_PART_WORDS &&
+                candidate !in OUTDOOR_WORDS &&
+                candidate !in INDOOR_WORDS &&
+                candidate !in FOOD_WORDS &&
+                candidate !in ANIMAL_WORDS &&
+                candidate !in PEOPLE_WORDS &&
+                candidate !in TECH_WORDS
+        }
+    }
+
+    private fun articleFor(noun: String): String {
+        return when (noun.lowercase(Locale.getDefault())) {
+            in FEMININE_OBJECTS -> "una"
+            else -> "un"
+        }
+    }
+
+    private fun detectDominantColorName(bitmap: Bitmap): String? {
+        val sample = Bitmap.createScaledBitmap(bitmap, 24, 24, true)
+        var sumR = 0L
+        var sumG = 0L
+        var sumB = 0L
+        var count = 0
+
+        for (x in 0 until sample.width) {
+            for (y in 0 until sample.height) {
+                val pixel = sample.getPixel(x, y)
+                if (Color.alpha(pixel) < 120) continue
+                sumR += Color.red(pixel)
+                sumG += Color.green(pixel)
+                sumB += Color.blue(pixel)
+                count++
+            }
+        }
+        sample.recycle()
+        if (count == 0) return null
+
+        val r = (sumR / count).toInt()
+        val g = (sumG / count).toInt()
+        val b = (sumB / count).toInt()
+        val hsv = FloatArray(3)
+        Color.RGBToHSV(r, g, b, hsv)
+
+        val h = hsv[0]
+        val s = hsv[1]
+        val v = hsv[2]
+
+        if (v < 0.16f) return "negro"
+        if (v > 0.92f && s < 0.12f) return "blanco"
+        if (s < 0.18f) {
+            return when {
+                v < 0.35f -> "gris oscuro"
+                v < 0.70f -> "gris"
+                else -> "gris claro"
+            }
+        }
+
+        return when {
+            h < 20f || h >= 345f -> "rojo"
+            h < 48f -> "naranja"
+            h < 70f -> "amarillo"
+            h < 165f -> "verde"
+            h < 255f -> "azul"
+            h < 295f -> "violeta"
+            else -> "rosado"
+        }
     }
 
     private fun translateLabel(raw: String): String {
@@ -579,6 +666,45 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     companion object {
+        private val PRIMARY_OBJECT_ALIASES = mapOf(
+            "trash can" to "papelera",
+            "garbage can" to "papelera",
+            "recycling bin" to "papelera",
+            "waste container" to "papelera",
+            "dustbin" to "papelera",
+            "bin" to "papelera",
+            "papelera" to "papelera",
+            "basurero" to "papelera",
+            "contenedor de basura" to "papelera",
+            "container" to "contenedor",
+            "contenedor" to "contenedor",
+            "bottle" to "botella",
+            "botella" to "botella",
+            "cup" to "taza",
+            "taza" to "taza",
+            "chair" to "silla",
+            "silla" to "silla",
+            "table" to "mesa",
+            "mesa" to "mesa",
+            "car" to "auto",
+            "auto" to "auto",
+            "dog" to "perro",
+            "perro" to "perro",
+            "cat" to "gato",
+            "gato" to "gato",
+            "person" to "persona",
+            "persona" to "persona",
+        )
+
+        private val FEMININE_OBJECTS = setOf(
+            "papelera", "botella", "taza", "silla", "mesa", "persona", "bicicleta", "moto",
+        )
+
+        private val MATERIAL_OR_PART_WORDS = setOf(
+            "metal", "acero", "hierro", "plastico", "goma", "caucho", "madera", "vidrio",
+            "rueda", "neumatico", "tire", "wheel", "material", "textura",
+        )
+
         private val OUTDOOR_WORDS = setOf(
             "cielo", "nube", "arbol", "arboles", "pasto", "planta",
             "montana", "montanas", "calle", "carretera", "parque", "playa",
@@ -624,6 +750,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "car" to "auto",
             "truck" to "camion",
             "bus" to "omnibus",
+            "wheel" to "rueda",
+            "weel" to "rueda",
+            "tire" to "neumatico",
+            "metal" to "metal",
+            "steel" to "acero",
+            "iron" to "hierro",
+            "plastic" to "plastico",
+            "rubber" to "goma",
+            "trash can" to "papelera",
+            "garbage can" to "papelera",
+            "recycling bin" to "papelera",
+            "waste container" to "papelera",
+            "dustbin" to "papelera",
+            "bin" to "papelera",
             "bicycle" to "bicicleta",
             "motorcycle" to "moto",
             "tree" to "arbol",
